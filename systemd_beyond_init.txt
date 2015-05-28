@@ -1,0 +1,84 @@
+
+video: https://www.youtube.com/watch?v=TyMLi8QF6sw
+
+
+"systemd is a system and session manager for Linux"
+it manages the components of the system. Whaat processes are being run, etc.
+Also it manages GNOME or KDE sessions
+
+"Compatible with SysV and LSB init scripts"
+These scripts start/stop services on system boot
+
+"Systemd provides aggressive parallelization capabilities"
+we start everything in parallel
+
+"Uses socket and D-bus activation for starting services"
+It means that it can start services if something happens in a particular network socket
+
+"offers on-demand starting of daemons"
+We start the daemon when we use it
+
+"it keeps track of processes using Linux cgroups"
+cgroups are a kernel interface introduced 5/10 versions ago
+cgroups are "control groups".
+
+"it supports snapshotting and restoring of the system space"
+you can "save" a system state, and then restore it later
+
+"maintains mount and automount points"
+init system normaally didn't take care of this
+automounting is mounting except that the filesystem doesn't get mounted immediately,
+but it gets mounted the moment someone accesses it.
+
+"implements an elaborate transactional dependency-based service control logic"
+transaction means that when a service starts another service, either both start correctly
+or they're stopped.
+dependency-based means that services can specify their dependencies, and systemd will
+take care to run them when a service is started.
+control logic means that systemd manages the services and they can be started/stopped
+
+"it can work as a drop-in replacement for sysvinit"
+sysvinit is the classic implementation for the init system on linux.
+
+
+
+init
+it's a special process. The first process that's started when the kernel boots up
+it's PID 1
+has magic capabilities
+systemd substitutes this process
+if a process dies, all its children get re-parented to PID 1
+every single process is a child of PID 1
+
+The entire userspaace depends on init to be running/controlling everything
+some implementations are sysvinit, upstart, and now systemd
+
+
+parallelization
+one of the key things on systemd
+they get started in parallel with socket-based activation
+
+The reason why services have dependencies is that they haave sockets to
+communicate between them
+
+What they do is that athey pull out the socket bindings out of the daemon,
+do them in one step in the init system, and pass the sockets pre-initialized
+to the services
+
+After that one step to initialize the sockets, all the services are started in parallel
+
+Since the sockets are maintained by the system, the services caan crash (and get restarted)
+and none of the messages in the socket will be lost
+
+
+The kernel can schedule the execution order for us, since everything is parallel
+
+Therefore the init system doesn't have to have a large scheduler to manage dependencies
+
+In order to do this, the services have a file to specify the sockets that they need.
+
+The system will terminate services that are idle and the moment someone rights something to
+the socket, it starts the service
+
+
+

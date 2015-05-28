@@ -1,0 +1,461 @@
+
+
+Repositorio de systemd: http://cgit.freedesktop.org/systemd/systemd/
+
+
+Process Identifier 1
+
+On every Unix system there is one process with the special process identifier 1. It is started by the kernel
+before all other processes and is the parent process for all those other processes that have nobody else to
+be child of. Due to that it can do a lot of stuff that other processes cannot do. And it is also responsible
+for some things that other processes are not responsible for, such as bringing up and maintaining userspace
+during boot.
+
+Historically on Linux the software acting as PID 1 was the venerable sysvinit package, though it had been
+showing its age for quite a while. Many replacements have been suggested, only one of them really took off:
+Upstart, which has by now found its way into all major distributions.
+
+As mentioned, the central responsibility of an init system is to bring up userspace. And a good init system
+does that fast. Unfortunately, the traditional SysV init system was not particularly fast.
+
+For a fast and efficient boot-up two things are crucial:
+
+    To start less.
+    And to start more in parallel.
+
+What does that mean? Starting less means starting fewer services or deferring the starting of services until
+they are actually needed. There are some services where we know that they will be required sooner or later
+(syslog, D-Bus system bus, etc.), but for many others this isn't the case. For example, bluetoothd does not
+need to be running unless a bluetooth dongle is actually plugged in or an application wants to talk to its
+D-Bus interfaces. Same for a printing system: unless the machine physically is connected to a printer, or an
+application wants to print something, there is no need to run a printing daemon such as CUPS. Avahi: if the
+machine is not connected to a network, there is no need to run Avahi, unless some application wants to use
+its APIs. And even SSH: as long as nobody wants to contact your machine there is no need to run it, as long
+as it is then started on the first connection. (And admit it, on most machines where sshd might be listening
+somebody connects to it only every other month or so.)
+
+Starting more in parallel means that if we have to run something, we should not serialize its start-up (as
+sysvinit does), but run it all at the same time, so that the available CPU and disk IO bandwidth is maxed
+out, and hence the overall start-up time minimized.
+
+
+An init system that is responsible for maintaining services needs to listen to hardware and software changes.
+It needs to dynamically start (and sometimes stop) services as they are needed to run a program or enable
+some hardware.
+
+Most current systems that try to parallelize boot-up still synchronize the start-up of the various daemons
+involved: since Avahi needs D-Bus, D-Bus is started first, and only when D-Bus signals that it is ready,
+Avahi is started too. Similar for other services: livirtd and X11 need HAL (well, I am considering the
+Fedora 13 services here, ignore that HAL is obsolete), hence HAL is started first, before livirtd and X11
+are started. And libvirtd also needs Avahi, so it waits for Avahi too. And all of them require syslog, so
+they all wait until Syslog is fully started up and initialized. And so on.
+
+
+Parallelizing Socket Services
+
+This kind of start-up synchronization results in the serialization of a significant part of the boot process.
+Wouldn't it be great if we could get rid of the synchronization and serialization cost? Well, we can,
+actually. For that, we need to understand what exactly the daemons require from each other, and why their
+start-up is delayed. For traditional Unix daemons, there's one answer to it: they wait until the socket the
+other daemon offers its services on is ready for connections. Usually that is an AF_UNIX socket in the
+file-system, but it could be AF_INET[6], too.
+
+
+Now, if that's all they are waiting for, if we manage to make those sockets available for connection earlier
+and only actually wait for that instead of the full daemon start-up, then we can speed up the entire boot
+and start more processes in parallel. So, how can we do that? Actually quite easily in Unix-like systems: we
+can create the listening sockets before we actually start the daemon, and then just pass the socket during
+exec() to it. That way, we can create all sockets for all daemons in one step in the init system, and then
+in a second step run all daemons at once. If a service needs another, and it is not fully started up, that's
+completely OK: what will happen is that the connection is queued in the providing service and the client
+will potentially block on that single request. But only that one client will block and only on that one
+request. Also, dependencies between services will no longer necessarily have to be configured to allow
+proper parallelized start-up: if we start all sockets at once and a service needs another it can be sure
+that it can connect to its socket.
+
+
+Because this is at the core of what is following, let me say this again, with different words and by example:
+if you start syslog and and various syslog clients at the same time, what will happen in the scheme pointed
+out above is that the messages of the clients will be added to the /dev/log socket buffer. As long as that
+buffer doesn't run full, the clients will not have to wait in any way and can immediately proceed with their
+start-up. As soon as syslog itself finished start-up, it will dequeue all messages and process them. Another
+example: we start D-Bus and several clients at the same time. If a synchronous bus request is sent and hence
+a reply expected, what will happen is that the client will have to block, however only that one client and
+only until D-Bus managed to catch up and process it.
+
+
+
+Basically, the kernel socket buffers help us to maximize parallelization, and the ordering and
+synchronization is done by the kernel, without any further management from userspace! And if all the sockets
+are available before the daemons actually start-up, dependency management also becomes redundant (or at
+least secondary): if a daemon needs another daemon, it will just connect to it. If the other daemon is
+already started, this will immediately succeed. If it isn't started but in the process of being started, the
+first daemon will not even have to wait for it, unless it issues a synchronous request. And even if the
+other daemon is not running at all, it can be auto-spawned. From the first daemon's perspective there is no
+difference, hence dependency management becomes mostly unnecessary or at least secondary, and all of this in
+optimal parallelization and optionally with on-demand loading. On top of this, this is also more robust,
+because the sockets stay available regardless whether the actual daemons might temporarily become
+unavailable (maybe due to crashing). In fact, you can easily write a daemon with this that can run, and
+exit (or crash), and run again and exit again (and so on), and all of that without the clients noticing or
+loosing any request.
+
+
+
+
+Parallelizing Bus Services
+
+Modern daemons on Linux tend to provide services via D-Bus instead of plain AF_UNIX sockets. Now, the
+question is, for those services, can we apply the same parallelizing boot logic as for traditional socket
+services? Yes, we can, D-Bus already has all the right hooks for it: using bus activation a service can be
+started the first time it is accessed. Bus activation also gives us the minimal per-request synchronisation
+we need for starting up the providers and the consumers of D-Bus services at the same time: if we want to
+start Avahi at the same time as CUPS (side note: CUPS uses Avahi to browse for mDNS/DNS-SD printers), then
+we can simply run them at the same time, and if CUPS is quicker than Avahi via the bus activation logic we
+can get D-Bus to queue the request until Avahi manages to establish its service name.
+
+So, in summary: the socket-based service activation and the bus-based service activation together enable us
+to start all daemons in parallel, without any further synchronization. Activation also allows us to do
+lazy-loading of services: if a service is rarely used, we can just load it the first time somebody accesses
+the socket or bus name, instead of starting it during boot.
+
+
+
+
+Parallelizing File System Jobs
+
+If you look at the serialization graphs of the boot process of current distributions, there are more
+synchronisation points than just daemon start-ups: most prominently there are file-system related jobs:
+mounting, fscking, quota. Right now, on boot-up a lot of time is spent idling to wait until all devices that
+are listed in /etc/fstab show up in the device tree and are then fsck'ed, mounted, quota checked
+(if enabled).a Only after that is fully finished we go on and boot the actual services.
+
+Can we improve this? It turns out we can. Harald Hoyer came up with the idea of using the venerable autofs
+system for this:
+
+Just like a connect() call shows that a service is interested in another service, an open() (or a similar
+call) shows that a service is interested in a specific file or file-system. So, in order to improve how much
+we can parallelize we can make those apps wait only if a file-system they are looking for is not yet mounted
+and readily available: we set up an autofs mount point, and then when our file-system finished fsck and
+quota due to normal boot-up we replace it by the real mount. While the file-system is not ready yet, the
+access will be queued by the kernel and the accessing process will block, but only that one daemon and only
+that one access. And this way we can begin starting our daemons even before all file systems have been fully
+made available -- without them missing any files, and maximizing parallelization.
+
+
+
+Using autofs here simply means that we can create a mount point without having to provide the backing file
+system right-away. In effect it hence only delays accesses. If an application tries to access an autofs
+file-system and we take very long to replace it with the real file-system, it will hang in an interruptible
+sleep, meaning that you can safely cancel it, for example via C-c. Also note that at any point, if the mount
+point should not be mountable in the end (maybe because fsck failed), we can just tell autofs to return a
+clean error code (like ENOENT).
+
+
+
+
+Keeping the First User PID Small
+
+shell scripts are big, slow, complicated, and fragile
+
+So, let's get rid of shell scripts in the boot process! Before we can do that we need to figure out what
+they are currently actually used for: well, the big picture is that most of the time, what they do is
+actually quite boring. Most of the scripting is spent on trivial setup and tear-down of services, and should
+be rewritten in C, either in separate executables, or moved into the daemons themselves, or simply be done
+in the init system.
+
+
+
+
+Keeping Track of Processes
+
+A central part of a system that starts up and maintains services should be process babysitting: it should
+watch services. Restart them if they shut down. If they crash it should collect information about them, and
+keep it around for the administrator, and cross-link that information with what is available from crash dump
+systems such as abrt, and in logging systems like syslog or the audit system.
+
+It should also be capable of shutting down a service completely. That might sound easy, but is harder than
+you think. Traditionally on Unix a process that does double-forking can escape the supervision of its
+parent, and the old parent will not learn about the relation of the new process to the one it actually
+started.
+
+So what can we do about this? Well, since quite a while the kernel knows Control Groups (aka "cgroups").
+Basically they allow the creation of a hierarchy of groups of processes. The hierarchy is directly exposed
+in a virtual file-system, and hence easily accessible. The group names are basically directory names in that
+file-system. If a process belonging to a specific cgroup fork()s, its child will become a member of the same
+group. Unless it is privileged and has access to the cgroup file system it cannot escape its group.
+Originally, cgroups have been introduced into the kernel for the purpose of containers: certain kernel
+subsystems can enforce limits on resources of certain groups, such as limiting CPU or memory usage.
+Traditional resource limits (as implemented by setrlimit()) are (mostly) per-process. cgroups on the other
+hand let you enforce limits on entire groups of processes. cgroups are also useful to enforce limits outside
+of the immediate container use case. You can use it for example to limit the total amount of memory or CPU
+Apache and all its children may use. Then, a misbehaving CGI script can no longer escape your setrlimit()
+resource control by simply forking away.
+
+
+In addition to container and resource limit enforcement cgroups are very useful to keep track of daemons:
+cgroup membership is securely inherited by child processes, they cannot escape. There's a notification
+system available so that a supervisor process can be notified when a cgroup runs empty. You can find the
+cgroups of a process by reading /proc/$PID/cgroup. cgroups hence make a very good choice to keep track of
+processes for babysitting purposes.
+
+
+Finally logging is an important part of executing services: ideally every bit of output a service generates
+should be logged away. An init system should hence provide logging to daemons it spawns right from the
+beginning, and connect stdout and stderr to syslog or in some cases even /dev/kmsg which in many cases makes
+a very useful replacement for syslog (embedded folks, listen up!), especially in times where the kernel log
+buffer is configured ridiculously large out-of-the-box.
+
+
+
+
+A good init system should start only what is needed, and that on-demand. Either lazily or parallelized and
+in advance. However it should not start more than necessary, particularly not everything installed that
+could use that service.
+
+
+
+
+
+
+SYSTEMD:
+
+systemd starts up and supervises the entire system (hence the name...). It implements all of the features
+pointed out above and a few more. It is based around the notion of units. Units have a name and a type.
+Since their configuration is usually loaded directly from the file system, these unit names are actually
+file names. Example: a unit avahi.service is read from a configuration file by the same name, and of course
+could be a unit encapsulating the Avahi daemon. There are several kinds of units:
+
+    service:   these are the most obvious kind of unit: daemons that can be started, stopped, restarted,
+               reloaded. For compatibility with SysV we not only support our own configuration files for
+               services, but also are able to read classic SysV init scripts, in particular we parse the LSB
+               header, if it exists. /etc/init.d is hence not much more than just another source of
+               configuration.
+    socket:    this unit encapsulates a socket in the file-system or on the Internet. We currently support
+               AF_INET, AF_INET6, AF_UNIX sockets of the types stream, datagram, and sequential packet. We
+               also support classic FIFOs as transport. Each socket unit has a matching service unit, that is
+               started if the first connection comes in on the socket or FIFO. Example: nscd.socket starts
+               nscd.service on an incoming connection.
+    device:    this unit encapsulates a device in the Linux device tree. If a device is marked for this via
+               udev rules, it will be exposed as a device unit in systemd. Properties set with udev can be
+               used as configuration source to set dependencies for device units.
+    mount:     this unit encapsulates a mount point in the file system hierarchy. systemd monitors all mount
+               points how they come and go, and can also be used to mount or unmount mount-points.
+               /etc/fstab is used here as an additional configuration source for these mount points, similar
+               to how SysV init scripts can be used as additional configuration source for service units.
+    automount: this unit type encapsulates an automount point in the file system hierarchy. Each automount
+               unit has a matching mount unit, which is started (i.e. mounted) as soon as the automount
+               directory is accessed.
+    target:    this unit type is used for logical grouping of units: instead of actually doing anything by
+               itself it simply references other units, which thereby can be controlled together. Examples
+               for this are: multi-user.target, which is a target that basically plays the role of run-level
+               5 on classic SysV system, or bluetooth.target which is requested as soon as a bluetooth
+               dongle becomes available and which simply pulls in bluetooth related services that otherwise
+               would not need to be started: bluetoothd and obexd and suchlike.
+    snapshot:  similar to target units snapshots do not actually do anything themselves and their only
+               purpose is to reference other units. Snapshots can be used to save/rollback the state of all
+               services and units of the init system. Primarily it has two intended use cases: to allow the
+               user to temporarily enter a specific state such as "Emergency Shell", terminating current
+               services, and provide an easy way to return to the state before, pulling up all services
+               again that got temporarily pulled down. And to ease support for system suspending: still many
+               services cannot correctly deal with system suspend, and it is often a better idea to shut
+               them down before suspend, and restore them afterwards.
+
+All these units can have dependencies between each other (both positive and negative, i.e. 'Requires' and
+'Conflicts'): a device can have a dependency on a service, meaning that as soon as a device becomes
+available a certain service is started. Mounts get an implicit dependency on the device they are mounted
+from. Mounts also gets implicit dependencies to mounts that are their prefixes (i.e. a mount /home/lennart
+implicitly gets a dependency added to the mount for /home) and so on.
+
+A short list of other features:
+
+    For each process that is spawned, you may control: the environment, resource limits, working and root
+        directory, umask, OOM killer adjustment, nice level, IO class and priority, CPU policy and priority,
+        CPU affinity, timer slack, user id, group id, supplementary group ids,
+        readable/writable/inaccessible directories, shared/private/slave mount flags, capabilities/bounding
+        set, secure bits, CPU scheduler reset of fork, private /tmp name-space, cgroup control for various
+        subsystems. Also, you can easily connect stdin/stdout/stderr of services to syslog, /dev/kmsg,
+        arbitrary TTYs. If connected to a TTY for input systemd will make sure a process gets exclusive
+        access, optionally waiting or enforcing it.
+        
+    Every executed process gets its own cgroup (currently by default in the debug subsystem, since that
+        subsystem is not otherwise used and does not much more than the most basic process grouping), and it
+        is very easy to configure systemd to place services in cgroups that have been configured externally,
+        for example via the libcgroups utilities.
+        
+    The native configuration files use a syntax that closely follows the well-known .desktop files. It is a
+        simple syntax for which parsers exist already in many software frameworks. Also, this allows us to
+        rely on existing tools for i18n for service descriptions, and similar. Administrators and developers
+        don't need to learn a new syntax.
+        
+    As mentioned, we provide compatibility with SysV init scripts. We take advantages of LSB and Red Hat
+        chkconfig headers if they are available. If they aren't we try to make the best of the otherwise
+        available information, such as the start priorities in /etc/rc.d. These init scripts are simply
+        considered a different source of configuration, hence an easy upgrade path to proper systemd
+        services is available. Optionally we can read classic PID files for services to identify the main
+        pid of a daemon. Note that we make use of the dependency information from the LSB init script
+        headers, and translate those into native systemd dependencies. Side note: Upstart is unable to
+        harvest and make use of that information. Boot-up on a plain Upstart system with mostly LSB SysV
+        init scripts will hence not be parallelized, a similar system running systemd however will. In fact,
+        for Upstart all SysV scripts together make one job that is executed, they are not treated
+        individually, again in contrast to systemd where SysV init scripts are just another source of
+        configuration and are all treated and controlled individually, much like any other native systemd
+        service.
+        
+    Similarly, we read the existing /etc/fstab configuration file, and consider it just another source of
+        configuration. Using the comment= fstab option you can even mark /etc/fstab entries to become
+        systemd controlled automount points.
+        
+    If the same unit is configured in multiple configuration sources (e.g. /etc/systemd/system/avahi.service
+        exists, and /etc/init.d/avahi too), then the native configuration will always take precedence, the
+        legacy format is ignored, allowing an easy upgrade path and packages to carry both a SysV init
+        script and a systemd service file for a while.
+        
+    We support a simple templating/instance mechanism. Example: instead of having six configuration files
+        for six gettys, we only have one getty@.service file which gets instantiated to getty@tty2.service
+        and suchlike. The interface part can even be inherited by dependency expressions, i.e. it is easy to
+        encode that a service dhcpcd@eth0.service pulls in avahi-autoipd@eth0.service, while leaving the
+        eth0 string wild-carded.
+        
+    For socket activation we support full compatibility with the traditional inetd modes, as well as a very
+        simple mode that tries to mimic launchd socket activation and is recommended for new services. The
+        inetd mode only allows passing one socket to the started daemon, while the native mode supports
+        passing arbitrary numbers of file descriptors. We also support one instance per connection, as well
+        as one instance for all connections modes. In the former mode we name the cgroup the daemon will be
+        started in after the connection parameters, and utilize the templating logic mentioned above for
+        this. Example: sshd.socket might spawn services sshd@192.168.0.1-4711-192.168.0.2-22.service with a
+        cgroup of sshd@.service/192.168.0.1-4711-192.168.0.2-22 (i.e. the IP address and port numbers are
+        used in the instance names. For AF_UNIX sockets we use PID and user id of the connecting client).
+        This provides a nice way for the administrator to identify the various instances of a daemon and
+        control their runtime individually. The native socket passing mode is very easily implementable in
+        applications: if $LISTEN_FDS is set it contains the number of sockets passed and the daemon will
+        find them sorted as listed in the .service file, starting from file descriptor 3 (a nicely written
+        daemon could also use fstat() and getsockname() to identify the sockets in case it receives more
+        than one). In addition we set $LISTEN_PID to the PID of the daemon that shall receive the fds,
+        because environment variables are normally inherited by sub-processes and hence could confuse
+        processes further down the chain. Even though this socket passing logic is very simple to implement
+        in daemons, we will provide a BSD-licensed reference implementation that shows how to do this. We
+        have ported a couple of existing daemons to this new scheme.
+        
+    We provide compatibility with /dev/initctl to a certain extent. This compatibility is in fact
+        implemented with a FIFO-activated service, which simply translates these legacy requests to D-Bus
+        requests. Effectively this means the old shutdown, poweroff and similar commands from Upstart and
+        sysvinit continue to work with systemd.
+    
+    We also provide compatibility with utmp and wtmp. Possibly even to an extent that is far more than
+        healthy, given how crufty utmp and wtmp are.
+        
+    systemd supports several kinds of dependencies between units. After/Before can be used to fix the
+        ordering how units are activated. It is completely orthogonal to Requires and Wants, which express a
+        positive requirement dependency, either mandatory, or optional. Then, there is Conflicts which
+        expresses a negative requirement dependency. Finally, there are three further, less used dependency
+        types.
+        
+    systemd has a minimal transaction system. Meaning: if a unit is requested to start up or shut down we
+        will add it and all its dependencies to a temporary transaction. Then, we will verify if the
+        transaction is consistent (i.e. whether the ordering via After/Before of all units is cycle-free). If
+        it is not, systemd will try to fix it up, and removes non-essential jobs from the transaction that
+        might remove the loop. Also, systemd tries to suppress non-essential jobs in the transaction that
+        would stop a running service. Non-essential jobs are those which the original request did not
+        directly include but which where pulled in by Wants type of dependencies. Finally we check whether
+        the jobs of the transaction contradict jobs that have already been queued, and optionally the
+        transaction is aborted then. If all worked out and the transaction is consistent and minimized in its
+        impact it is merged with all already outstanding jobs and added to the run queue. Effectively this
+        means that before executing a requested operation, we will verify that it makes sense, fixing it if
+        possible, and only failing if it really cannot work.
+        
+    We record start/exit time as well as the PID and exit status of every process we spawn and supervise.
+        This data can be used to cross-link daemons with their data in abrtd, auditd and syslog. Think of an
+        UI that will highlight crashed daemons for you, and allows you to easily navigate to the respective
+        UIs for syslog, abrt, and auditd that will show the data generated from and for this daemon on a
+        specific run.
+        
+    We support reexecution of the init process itself at any time. The daemon state is serialized before the
+        reexecution and deserialized afterwards. That way we provide a simple way to facilitate init system
+        upgrades as well as handover from an initrd daemon to the final daemon. Open sockets and autofs
+        mounts are properly serialized away, so that they stay connectible all the time, in a way that
+        clients will not even notice that the init system reexecuted itself. Also, the fact that a big part
+        of the service state is encoded anyway in the cgroup virtual file system would even allow us to
+        resume execution without access to the serialization data. The reexecution code paths are actually
+        mostly the same as the init system configuration reloading code paths, which guarantees that
+        reexecution (which is probably more seldom triggered) gets similar testing as reloading (which is
+        probably more common).
+        
+    Starting the work of removing shell scripts from the boot process we have recoded part of the basic
+        system setup in C and moved it directly into systemd. Among that is mounting of the API file
+        systems (i.e. virtual file systems such as /proc, /sys and /dev.) and setting of the host-name.
+        
+    Server state is introspectable and controllable via D-Bus. This is not complete yet but quite extensive.
+    
+    While we want to emphasize socket-based and bus-name-based activation, and we hence support dependencies
+        between sockets and services, we also support traditional inter-service dependencies. We support
+        multiple ways how such a service can signal its readiness: by forking and having the start process
+        exit (i.e. traditional daemonize() behaviour), as well as by watching the bus until a configured
+        service name appears.
+        
+    There's an interactive mode which asks for confirmation each time a process is spawned by systemd. You
+        may enable it by passing systemd.confirm_spawn=1 on the kernel command line.
+        
+    With the systemd.default= kernel command line parameter you can specify which unit systemd should start
+        on boot-up. Normally you'd specify something like multi-user.target here, but another choice could
+        even be a single service instead of a target, for example out-of-the-box we ship a service
+        emergency.service that is similar in its usefulness as init=/bin/bash, however has the advantage of
+        actually running the init system, hence offering the option to boot up the full system from the
+        emergency shell.
+        
+    There's a minimal UI that allows you to start/stop/introspect services. It's far from complete but
+        useful as a debugging tool. It's written in Vala (yay!) and goes by the name of systemadm.
+
+It should be noted that systemd uses many Linux-specific features, and does not limit itself to POSIX. That
+unlocks a lot of functionality a system that is designed for portability to other operating systems cannot
+provide.
+
+
+
+CGROUPS:
+
+1.1 What are cgroups ?
+----------------------
+
+Control Groups provide a mechanism for aggregating/partitioning sets of
+tasks, and all their future children, into hierarchical groups with
+specialized behaviour.
+
+Definitions:
+
+A *cgroup* associates a set of tasks with a set of parameters for one
+or more subsystems.
+
+A *subsystem* is a module that makes use of the task grouping
+facilities provided by cgroups to treat groups of tasks in
+particular ways. A subsystem is typically a "resource controller" that
+schedules a resource or applies per-cgroup limits, but it may be
+anything that wants to act on a group of processes, e.g. a
+virtualization subsystem.
+
+A *hierarchy* is a set of cgroups arranged in a tree, such that
+every task in the system is in exactly one of the cgroups in the
+hierarchy, and a set of subsystems; each subsystem has system-specific
+state attached to each cgroup in the hierarchy.  Each hierarchy has
+an instance of the cgroup virtual filesystem associated with it.
+
+At any one time there may be multiple active hierarchies of task
+cgroups. Each hierarchy is a partition of all tasks in the system.
+
+User-level code may create and destroy cgroups by name in an
+instance of the cgroup virtual file system, specify and query to
+which cgroup a task is assigned, and list the task PIDs assigned to
+a cgroup. Those creations and assignments only affect the hierarchy
+associated with that instance of the cgroup file system.
+
+On their own, the only use for cgroups is for simple job
+tracking. The intention is that other subsystems hook into the generic
+cgroup support to provide new attributes for cgroups, such as
+accounting/limiting the resources which processes in a cgroup can
+access. For example, cpusets (see Documentation/cgroups/cpusets.txt) allow
+you to associate a set of CPUs and a set of memory nodes with the
+tasks in each cgroup.
+
+
+
+
+

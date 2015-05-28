@@ -18,3 +18,5 @@ Investigacion sobre systemd
 - falacias sobre systemd: http://judecnelson.blogspot.com/2014/09/systemd-biggest-fallacies.html
 - por que systemd "gano": http://utcc.utoronto.ca/~cks/space/blog/linux/SystemdWhyItWon
 - por que systemd?: http://blog.jorgenschaefer.de/2014/07/why-systemd.html
+
+- documentacion del kernel sobre cgroups: http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/tree/Documentation/cgroups/cgroups.txt?id=HEAD
